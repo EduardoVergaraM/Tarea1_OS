@@ -10,7 +10,6 @@
 #include <signal.h> //sigaction, kill
 #include <errno.h>  //errno, EINTR
 
-
 typedef enum { BLOQUEADA, LISTA, EJECUTANDO, TERMINADA, FALLIDA, ABORTADA } Estado;
 
 typedef struct {
@@ -19,8 +18,11 @@ typedef struct {
     int tiempo;                 // ms
     Estado estado;
     int cont;                   // dependencias pendientes (indegree)
-    int *sucesores;             // índices de las tareas que dependen de esta -> que pasa si lo hao estatico????
+    int *sucesores;             
     int num_sucesores, cap_sucesores;
+    int predecesores[50];
+    int num_predecesores;
+    int lecturas_pendientes;
     char insumos[512];          // mensajes recibidos de sus dependencias
     pid_t pid;
     int fd_pipe[2];
@@ -30,7 +32,7 @@ typedef struct {
 Proceso planificacion[10000];
 int total_tareas = 0;
 
-static char *trim(char *s) { //quita los espacios del inicio y del final de un texto, es realmente necesario???
+static char *trim(char *s) { 
     while (isspace((unsigned char)*s)) s++;
     char *e = s + strlen(s);
     while (e > s && isspace((unsigned char)e[-1])) e--;
@@ -38,9 +40,8 @@ static char *trim(char *s) { //quita los espacios del inicio y del final de un t
     return s;
 }
 
-// Busca el índice de una tarea por su ID (texto)
 static int buscar_indice(const char *id) {
-    for (int i = 0; i < total_tareas; i++)//->bsuqueda lineal 
+    for (int i = 0; i < total_tareas; i++)
         if (strcmp(planificacion[i].id, id) == 0) return i;
     return -1;
 }
@@ -55,7 +56,6 @@ static void agregar_sucesor(Proceso *p, int idx) {
     p->sucesores[p->num_sucesores++] = idx;
 }
 
-// Lee el archivo y construye el DAG. Retorna 0 si todo bien, -1 si hay error.
 int cargar_plan(const char *ruta) {
     FILE *f = fopen(ruta, "r");
     if (!f) { perror(ruta); return -1; }
@@ -63,18 +63,16 @@ int cargar_plan(const char *ruta) {
     char linea[4096];
     int nlinea = 0;
 
-    // ---- Pasada 1: leer cada línea ----
     while (fgets(linea, sizeof linea, f)) {
         nlinea++;
         char *l = trim(linea);
-        if (*l == '\0') continue;                       // línea vacía
+        if (*l == '\0') continue;                       
 
         if (total_tareas == 10000) {
             fprintf(stderr, "Error: más de %d actividades\n", 10000);
             fclose(f); return -1;
         }
 
-        // Separar por ':' en máximo 4 campos
         char *campos[4];
         int n = 0;
         char *p = l;
@@ -84,8 +82,8 @@ int cargar_plan(const char *ruta) {
             campos[n++] = p;
         }
 
-        Proceso *t = &planificacion[total_tareas]; //????
-        memset(t, 0, sizeof *t); //deja tarea vacia
+        Proceso *t = &planificacion[total_tareas]; 
+        memset(t, 0, sizeof *t); 
         t->pid = -1;
 
         snprintf(t->id, sizeof t->id, "%s", trim(campos[0]));
@@ -93,7 +91,7 @@ int cargar_plan(const char *ruta) {
 
         char *tt = trim(campos[2]);
         if (*tt == '\0') {
-            t->tiempo = 100 + rand() % 4901;            // aleatorio 100-5000 ms
+            t->tiempo = 100 + rand() % 4901;            
         } else {
             char *fin;
             long v = strtol(tt, &fin, 10);
@@ -109,7 +107,6 @@ int cargar_plan(const char *ruta) {
     }
     fclose(f);
 
-    // ---- Pasada 2: resolver dependencias (pueden referirse a IDs que aparecen más abajo) ----
     for (int i = 0; i < total_tareas; i++) {
         Proceso *t = &planificacion[i];
         char *tok = strtok(t->deps_texto, ",");
@@ -122,6 +119,9 @@ int cargar_plan(const char *ruta) {
                     return -1;
                 }
                 agregar_sucesor(&planificacion[j], i);
+                
+                //El hijo anota a su predecesor
+                t->predecesores[t->num_predecesores++] = j; 
                 t->cont++;
             }
             tok = strtok(NULL, ",");
@@ -130,10 +130,15 @@ int cargar_plan(const char *ruta) {
         t->deps_texto = NULL;
         t->estado = (t->cont == 0) ? LISTA : BLOQUEADA;
     }
+
+    // 
+    for(int i = 0; i < total_tareas; i++){ 
+        planificacion[i].lecturas_pendientes = planificacion[i].num_sucesores;
+    }
+
     return 0;
 }
 
-// Marca como ABORTADA toda la descendencia de la tarea idx
 int abortar_rama(int idx) {
     int abortadas = 0;
     for (int j = 0; j < planificacion[idx].num_sucesores; j++) {
@@ -147,22 +152,22 @@ int abortar_rama(int idx) {
     }
     return abortadas;
 }
-#define PROB_FALLO 5 //cambiar a 0 para no tener fallos en el proceso
+
+#define PROB_FALLO 5 
 
 int ejecutar_actividad(int i) {
-    srand(time(NULL) ^ getpid());            // semilla propia de este hijo
-    usleep(planificacion[i].tiempo * 1000);  // simula el trabajo
+    srand(time(NULL) ^ getpid());            
+    usleep(planificacion[i].tiempo * 1000);  
     if (rand() % 100 < PROB_FALLO)
-        return 1;                            // falla interna
-    return 0;                                // éxito
+        return 1;                            
+    return 0;                                
 }
 
-// ---- Inspección de la Seremi (Ctrl+C) ----
-volatile sig_atomic_t seremi = 0;   // se pone en 1 cuando llega SIGINT
+volatile sig_atomic_t seremi = 0;   
 
 void manejar_sigint(int sig) {
     (void)sig;
-    seremi = 1;                     // solo marcar; el trabajo se hace fuera del handler
+    seremi = 1;                     
 }
 
 void instalar_sigint(void) {
@@ -170,11 +175,10 @@ void instalar_sigint(void) {
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = manejar_sigint;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;                // sin SA_RESTART: wait() se interrumpe con EINTR
+    sa.sa_flags = 0;                
     sigaction(SIGINT, &sa, NULL);
 }
 
-// Mata a los hijos en ejecución, espera a todos y aborta lo pendiente
 void inspeccion_seremi(void) {
     printf("\n¡Llegó la Seremi! Abortando todas las actividades...\n");
     for (int i = 0; i < total_tareas; i++) {
@@ -186,89 +190,125 @@ void inspeccion_seremi(void) {
             planificacion[i].estado = ABORTADA;
         }
     }
-    while (wait(NULL) > 0);         // recoger a todos los hijos: sin zombis
+    while (wait(NULL) > 0);         
     printf("Planificador detenido.\n");
 }
 
-//Funcion principal que se encarga de simular el planificador
 void simular_planificador(int K) {
     int procesos_activos = 0;
-    int tareas_finalizadas = 0; // Contador de tareas terminadas y abortadas
+    int tareas_finalizadas = 0; 
 
     while (tareas_finalizadas < total_tareas) {
         
         if (seremi) { inspeccion_seremi(); return; } 
 
-        // Etapa donde el padre se encarga de asignar una tarea a un hijo y actualizar datos de variables en el arreglo del struct de Procesos
-        for (int i = 0; i < total_tareas && procesos_activos < K; i++) { //condicion para que cada vez que se ejecute el ciclo, se verifiquen todas las tareas nuevamente y no se tengan mas procesos en ejecucion de los que nos permite k
+        for (int i = 0; i < total_tareas && procesos_activos < K; i++) { 
             
             if (planificacion[i].estado == LISTA) {
+
+                //Creación del pipe
+                if(pipe(planificacion[i].fd_pipe) == -1){
+                    perror("Error al crear pipe");
+                    exit(1);
+                }
 
                 pid_t pid = fork();
 
                 if (pid == 0) {
-                    
-                    /*Remplazar para no ver el fallo de la actividad
-                    usleep(planificacion[i].tiempo * 1000); //simular tiempo de trabajo
-                    _exit(0); 
-                    */
+                    // Restaurar comportamiento de señal en el hijo
                     signal(SIGINT, SIG_DFL);  
-                    _exit(ejecutar_actividad(i));
+
+                    //Lectura de predecesores
+                    close(planificacion[i].fd_pipe[0]);
+
+                    planificacion[i].insumos[0] = '\0'; 
+                    for(int j=0; j<planificacion[i].num_predecesores; j++){
+                        int id_padre = planificacion[i].predecesores[j];
+                        char buffer[128];
+                        int bytes = read(planificacion[id_padre].fd_pipe[0], buffer, sizeof(buffer)-1);
+                        
+                        if(bytes>0){
+                            buffer[bytes] = '\0';
+                            strcat(planificacion[i].insumos, buffer);
+                            strcat(planificacion[i].insumos, " | ");
+                        }
+                    }
+
+                    if(strlen(planificacion[i].insumos) > 0){
+                        printf("%s depende de: %s\n", planificacion[i].nombre, planificacion[i].insumos);
+                    }
+
+                    // Simulación de trabajo y fallo aleatorio
+                    int status_salida = ejecutar_actividad(i);
+
+                    // Solo escribe si la actividad terminó con éxito
+                    if (status_salida == 0) {
+                        char msj[128];
+                        snprintf(msj, sizeof(msj), "Tarea %s", planificacion[i].id);
+                        write(planificacion[i].fd_pipe[1], msj, strlen(msj));
+                    }
+                    
+                    close(planificacion[i].fd_pipe[1]);
+
+                    _exit(status_salida);
 
                 } else if (pid > 0) {
-                    planificacion[i].pid = pid;            //Se asocia el pid del hijo a una tarea
-                    planificacion[i].estado = EJECUTANDO;  //Se actualiza el estado
+                    
+                    //Limpieza de descriptores
+                    close(planificacion[i].fd_pipe[1]);
+
+                    if(planificacion[i].lecturas_pendientes == 0){
+                        close(planificacion[i].fd_pipe[0]);
+                    }
+
+                    for(int j = 0; j < planificacion[i].num_predecesores; j++){
+                        int id_padre = planificacion[i].predecesores[j];
+                        planificacion[id_padre].lecturas_pendientes--;
+
+                        if(planificacion[id_padre].lecturas_pendientes == 0){
+                            close(planificacion[id_padre].fd_pipe[0]);
+                        }
+                    }
+
+                    planificacion[i].pid = pid;            
+                    planificacion[i].estado = EJECUTANDO;  
                     procesos_activos++;  
                     printf("INICIO %s (%s) [%d/%d]\n", planificacion[i].id, planificacion[i].nombre, procesos_activos, K);
-                  // Se actualiza la cantidad de procesos activos
                 } else {
                     perror("Error al hacer fork");
                     planificacion[i].estado = FALLIDA;
-                    
                     tareas_finalizadas += 1 + abortar_rama(i);
                 }
             }
         }
 
-        // Etapa donde el padre verifica el estado de los procesos hijos
         if (procesos_activos > 0) {
-            
             int status;
             pid_t pid_terminado = wait(&status); 
 
             if (pid_terminado < 0 && errno == EINTR) continue;
 
             if (pid_terminado > 0) {
-                
-                procesos_activos--; // Se libera un espacio para procesar otra tarea
-                tareas_finalizadas++; // Se suma una tarea finalizada independientemente de si termino correctamente o no
+                procesos_activos--; 
+                tareas_finalizadas++; 
 
-                // Se actualiza el estado de la tarea y tareas dependientes
                 for (int i = 0; i < total_tareas; i++) {
-                    
-                    if (planificacion[i].pid == pid_terminado) { //Se busca en el arreglo de procesos usando el pid asociado a la tarea previamente
-                        
-                        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) { //Verifica que el hijo termino correctamente
-                            
+                    if (planificacion[i].pid == pid_terminado) { 
+                        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) { 
                             planificacion[i].estado = TERMINADA;
                             printf("FIN %s OK\n", planificacion[i].id);
                             for (int j = 0; j < planificacion[i].num_sucesores; j++) {
                                 int sucesor = planificacion[i].sucesores[j];
-                                
                                 planificacion[sucesor].cont--;
-
-                                // Se verifica si tareas que dependian de otras pueden pasar a estado listo
                                 if (planificacion[sucesor].cont == 0) {
                                     planificacion[sucesor].estado = LISTA;
                                 }
                             }
-                            
-                        } else { //Else para manejar casos donde el hijo no termino correctamente
+                        } else { 
                            planificacion[i].estado = FALLIDA;
                            printf("FIN %s FALLÓ\n", planificacion[i].id);
                            tareas_finalizadas += abortar_rama(i);
                         }
-                        
                         break; 
                     }
                 }
