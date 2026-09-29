@@ -315,6 +315,14 @@ void simular_planificador(int K) {
             }
         }
     }
+    int ok = 0, fallidas = 0, abortadas = 0;
+    for (int i = 0; i < total_tareas; i++) {
+        if (planificacion[i].estado == TERMINADA) ok++;
+        else if (planificacion[i].estado == FALLIDA) fallidas++;
+        else if (planificacion[i].estado == ABORTADA) abortadas++;
+    }
+    printf("\n=== RESUMEN ===\nOK: %d | FALLIDAS: %d | ABORTADAS: %d | TOTAL: %d\n",
+    ok, fallidas, abortadas, total_tareas);
 }
 
 int main(int argc, char **argv) {
