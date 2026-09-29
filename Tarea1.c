@@ -7,7 +7,8 @@
 #include <ctype.h> //isspace /quita espacios de un texto
 #include <time.h> //time(NULL) para semilla de rand
 #include <sys/types.h> //pid_t
-
+#include <signal.h> //sigaction, kill
+#include <errno.h>  //errno, EINTR
 
 
 typedef enum { BLOQUEADA, LISTA, EJECUTANDO, TERMINADA, FALLIDA, ABORTADA } Estado;
@@ -146,6 +147,48 @@ int abortar_rama(int idx) {
     }
     return abortadas;
 }
+#define PROB_FALLO 5 //cambiar a 0 para no tener fallos en el proceso
+
+int ejecutar_actividad(int i) {
+    srand(time(NULL) ^ getpid());            // semilla propia de este hijo
+    usleep(planificacion[i].tiempo * 1000);  // simula el trabajo
+    if (rand() % 100 < PROB_FALLO)
+        return 1;                            // falla interna
+    return 0;                                // éxito
+}
+
+// ---- Inspección de la Seremi (Ctrl+C) ----
+volatile sig_atomic_t seremi = 0;   // se pone en 1 cuando llega SIGINT
+
+void manejar_sigint(int sig) {
+    (void)sig;
+    seremi = 1;                     // solo marcar; el trabajo se hace fuera del handler
+}
+
+void instalar_sigint(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = manejar_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;                // sin SA_RESTART: wait() se interrumpe con EINTR
+    sigaction(SIGINT, &sa, NULL);
+}
+
+// Mata a los hijos en ejecución, espera a todos y aborta lo pendiente
+void inspeccion_seremi(void) {
+    printf("\n¡Llegó la Seremi! Abortando todas las actividades...\n");
+    for (int i = 0; i < total_tareas; i++) {
+        if (planificacion[i].estado == EJECUTANDO) {
+            kill(planificacion[i].pid, SIGTERM);
+            planificacion[i].estado = ABORTADA;
+            printf("ABORTA %s (en ejecución)\n", planificacion[i].id);
+        } else if (planificacion[i].estado == LISTA || planificacion[i].estado == BLOQUEADA) {
+            planificacion[i].estado = ABORTADA;
+        }
+    }
+    while (wait(NULL) > 0);         // recoger a todos los hijos: sin zombis
+    printf("Planificador detenido.\n");
+}
 
 //Funcion principal que se encarga de simular el planificador
 void simular_planificador(int K) {
@@ -153,6 +196,8 @@ void simular_planificador(int K) {
     int tareas_finalizadas = 0; // Contador de tareas terminadas y abortadas
 
     while (tareas_finalizadas < total_tareas) {
+        
+        if (seremi) { inspeccion_seremi(); return; } 
 
         // Etapa donde el padre se encarga de asignar una tarea a un hijo y actualizar datos de variables en el arreglo del struct de Procesos
         for (int i = 0; i < total_tareas && procesos_activos < K; i++) { //condicion para que cada vez que se ejecute el ciclo, se verifiquen todas las tareas nuevamente y no se tengan mas procesos en ejecucion de los que nos permite k
@@ -162,9 +207,13 @@ void simular_planificador(int K) {
                 pid_t pid = fork();
 
                 if (pid == 0) {
-
+                    
+                    /*Remplazar para no ver el fallo de la actividad
                     usleep(planificacion[i].tiempo * 1000); //simular tiempo de trabajo
                     _exit(0); 
+                    */
+                    signal(SIGINT, SIG_DFL);  
+                    _exit(ejecutar_actividad(i));
 
                 } else if (pid > 0) {
                     planificacion[i].pid = pid;            //Se asocia el pid del hijo a una tarea
@@ -186,6 +235,8 @@ void simular_planificador(int K) {
             
             int status;
             pid_t pid_terminado = wait(&status); 
+
+            if (pid_terminado < 0 && errno == EINTR) continue;
 
             if (pid_terminado > 0) {
                 
@@ -242,7 +293,16 @@ int main(int argc, char **argv) {
 
     if (cargar_plan(argv[1]) != 0) return 1;
 
-    // Prueba: mostrar lo que se cargó --> sacar al finallllll!!!!!!!!!!!!!!!!
+    instalar_sigint();
+    
+    simular_planificador(K);    
+
+    for (int i = 0; i < total_tareas; i++) free(planificacion[i].sucesores);
+    return 0;
+}
+
+/**
+    // Prueba: mostrar lo que se cargó 
     printf("Cargadas %d actividades (K = %d)\n", total_tareas, K);
     for (int i = 0; i < total_tareas; i++) {
         Proceso *t = &planificacion[i];
@@ -252,9 +312,5 @@ int main(int argc, char **argv) {
             printf("%s%s", s ? ", " : "", planificacion[t->sucesores[s]].id);
         printf("]\n");
     }
-
-    simular_planificador(K);    
-
-    for (int i = 0; i < total_tareas; i++) free(planificacion[i].sucesores);
-    return 0;
-}
+    */
+    
