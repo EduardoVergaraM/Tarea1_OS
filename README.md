@@ -35,8 +35,9 @@ Implementado a través del conjunto de funciones `instalar_sigint()`, `manejar_s
 ## Compilación y ejecución
 
 ```bash
-gcc -Wall -Wextra -std=c17 Tarea1.c -o Tarea1
-./Tarea1 plan_X.txt K
+gcc -Wall -Wextra -std=c17 planificador.c -o planificador
+./planificador plan_X.txt K
+
 ```
 
 - `plan_chico.txt`: archivo con 10 actividades.
