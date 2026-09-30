@@ -15,17 +15,14 @@ typedef enum { BLOQUEADA, LISTA, EJECUTANDO, TERMINADA, FALLIDA, ABORTADA } Esta
 typedef struct {
     char id[32];
     char nombre[128];
-    int tiempo;                 // ms
+    int tiempo;                 
     Estado estado;
     int cont;                   // dependencias pendientes (indegree)
     int *sucesores;             
     int num_sucesores, cap_sucesores;
-    int predecesores[50];
-    int num_predecesores;
-    int lecturas_pendientes;
     char insumos[512];          // mensajes recibidos de sus dependencias
     pid_t pid;
-    int fd_pipe[2];
+    int fd_resultado;           // extremo de lectura del pipe hijo -> padre
     char *deps_texto;           // temporal: dependencias como texto hasta resolverlas
 } Proceso;
 
@@ -119,9 +116,7 @@ int cargar_plan(const char *ruta) {
                     return -1;
                 }
                 agregar_sucesor(&planificacion[j], i);
-                
-                //El hijo anota a su predecesor
-                t->predecesores[t->num_predecesores++] = j; 
+
                 t->cont++;
             }
             tok = strtok(NULL, ",");
@@ -129,11 +124,6 @@ int cargar_plan(const char *ruta) {
         free(t->deps_texto);
         t->deps_texto = NULL;
         t->estado = (t->cont == 0) ? LISTA : BLOQUEADA;
-    }
-
-    // 
-    for(int i = 0; i < total_tareas; i++){ 
-        planificacion[i].lecturas_pendientes = planificacion[i].num_sucesores;
     }
 
     return 0;
@@ -152,8 +142,9 @@ int abortar_rama(int idx) {
     }
     return abortadas;
 }
-
-#define PROB_FALLO 5 
+//probar fallos al modificar el valor de PROB_FALLO
+#define PROB_FALLO 5
+#define MSJ_LEN 64     
 
 int ejecutar_actividad(int i) {
     srand(time(NULL) ^ getpid());            
@@ -202,79 +193,78 @@ void simular_planificador(int K) {
         
         if (seremi) { inspeccion_seremi(); return; } 
 
-        for (int i = 0; i < total_tareas && procesos_activos < K; i++) { 
-            
+        for (int i = 0; i < total_tareas && procesos_activos < K; i++) {
+
             if (planificacion[i].estado == LISTA) {
 
-                //Creación del pipe
-                if(pipe(planificacion[i].fd_pipe) == -1){
-                    perror("Error al crear pipe");
-                    exit(1);
+                // Dos pipes por actividad:
+                //   p_in : padre -> hijo  (insumos de sus dependencias)
+                //   p_out: hijo  -> padre (mensaje al terminar)
+                int p_in[2], p_out[2];
+                if (pipe(p_in) == -1) {
+                    if (procesos_activos > 0) break;          // sin recursos: esperar a que termine alguien
+                    perror("pipe"); exit(1);
+                }
+                if (pipe(p_out) == -1) {
+                    close(p_in[0]); close(p_in[1]);
+                    if (procesos_activos > 0) break;
+                    perror("pipe"); exit(1);
                 }
 
+                fflush(stdout);   // evita que el hijo herede texto pendiente de imprimir
                 pid_t pid = fork();
 
                 if (pid == 0) {
-                    // Restaurar comportamiento de señal en el hijo
-                    signal(SIGINT, SIG_DFL);  
+                    
+                    signal(SIGINT, SIG_DFL);
+                    close(p_in[1]);
+                    close(p_out[0]);
 
-                    //Lectura de predecesores
-                    close(planificacion[i].fd_pipe[0]);
+                    // Leer los insumos que envió el padre
+                    char insumos[sizeof planificacion[i].insumos];
+                    ssize_t n, total = 0;
+                    while ((n = read(p_in[0], insumos + total, sizeof insumos - 1 - total)) > 0)
+                        total += n;
+                    insumos[total] = '\0';
+                    close(p_in[0]);
 
-                    planificacion[i].insumos[0] = '\0'; 
-                    for(int j=0; j<planificacion[i].num_predecesores; j++){
-                        int id_padre = planificacion[i].predecesores[j];
-                        char buffer[128];
-                        int bytes = read(planificacion[id_padre].fd_pipe[0], buffer, sizeof(buffer)-1);
-                        
-                        if(bytes>0){
-                            buffer[bytes] = '\0';
-                            strcat(planificacion[i].insumos, buffer);
-                            strcat(planificacion[i].insumos, " | ");
-                        }
+                    if (total > 0) {
+                        printf("%s recibe: %s\n", planificacion[i].nombre, insumos);
+                        fflush(stdout);
                     }
 
-                    if(strlen(planificacion[i].insumos) > 0){
-                        printf("%s depende de: %s\n", planificacion[i].nombre, planificacion[i].insumos);
-                    }
-
-                    // Simulación de trabajo y fallo aleatorio
                     int status_salida = ejecutar_actividad(i);
 
-                    // Solo escribe si la actividad terminó con éxito
+                    // Si terminó bien, avisa su insumo al padre
                     if (status_salida == 0) {
-                        char msj[128];
-                        snprintf(msj, sizeof(msj), "Tarea %s", planificacion[i].id);
-                        write(planificacion[i].fd_pipe[1], msj, strlen(msj));
+                        char msj[MSJ_LEN];
+                        int len = snprintf(msj, sizeof msj, "%.50s listo", planificacion[i].nombre);
+                        if (write(p_out[1], msj, len) < 0) { /* nada que hacer */ }
                     }
-                    
-                    close(planificacion[i].fd_pipe[1]);
-
+                    close(p_out[1]);
                     _exit(status_salida);
 
                 } else if (pid > 0) {
-                    
-                    //Limpieza de descriptores
-                    close(planificacion[i].fd_pipe[1]);
+                
+                    close(p_in[0]);
+                    close(p_out[1]);
 
-                    if(planificacion[i].lecturas_pendientes == 0){
-                        close(planificacion[i].fd_pipe[0]);
-                    }
+                    // Enviar los insumos acumulados y cerrar (el hijo recibe EOF)
+                    size_t len = strlen(planificacion[i].insumos);
+                    if (len > 0 && write(p_in[1], planificacion[i].insumos, len) < 0)
+                        perror("write");
+                    close(p_in[1]);
 
-                    for(int j = 0; j < planificacion[i].num_predecesores; j++){
-                        int id_padre = planificacion[i].predecesores[j];
-                        planificacion[id_padre].lecturas_pendientes--;
-
-                        if(planificacion[id_padre].lecturas_pendientes == 0){
-                            close(planificacion[id_padre].fd_pipe[0]);
-                        }
-                    }
-
-                    planificacion[i].pid = pid;            
-                    planificacion[i].estado = EJECUTANDO;  
-                    procesos_activos++;  
+                    planificacion[i].fd_resultado = p_out[0];
+                    planificacion[i].pid = pid;
+                    planificacion[i].estado = EJECUTANDO;
+                    procesos_activos++;
                     printf("INICIO %s (%s) [%d/%d]\n", planificacion[i].id, planificacion[i].nombre, procesos_activos, K);
+
                 } else {
+                    close(p_in[0]); close(p_in[1]);
+                    close(p_out[0]); close(p_out[1]);
+                    if (procesos_activos > 0) break;          // reintentar cuando se libere un cupo
                     perror("Error al hacer fork");
                     planificacion[i].estado = FALLIDA;
                     tareas_finalizadas += 1 + abortar_rama(i);
@@ -284,32 +274,43 @@ void simular_planificador(int K) {
 
         if (procesos_activos > 0) {
             int status;
-            pid_t pid_terminado = wait(&status); 
+            pid_t pid_terminado = wait(&status);
 
             if (pid_terminado < 0 && errno == EINTR) continue;
 
             if (pid_terminado > 0) {
-                procesos_activos--; 
-                tareas_finalizadas++; 
+                procesos_activos--;
+                tareas_finalizadas++;
 
                 for (int i = 0; i < total_tareas; i++) {
-                    if (planificacion[i].pid == pid_terminado) { 
-                        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) { 
+                    if (planificacion[i].pid == pid_terminado) {
+
+                        // Leer el mensaje que dejó el hijo y cerrar su pipe
+                        char msj[MSJ_LEN];
+                        ssize_t n = read(planificacion[i].fd_resultado, msj, sizeof msj - 1);
+                        msj[n > 0 ? n : 0] = '\0';
+                        close(planificacion[i].fd_resultado);
+
+                        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
                             planificacion[i].estado = TERMINADA;
                             printf("FIN %s OK\n", planificacion[i].id);
                             for (int j = 0; j < planificacion[i].num_sucesores; j++) {
-                                int sucesor = planificacion[i].sucesores[j];
-                                planificacion[sucesor].cont--;
-                                if (planificacion[sucesor].cont == 0) {
-                                    planificacion[sucesor].estado = LISTA;
-                                }
+                                Proceso *suc = &planificacion[planificacion[i].sucesores[j]];
+
+                                // Guardar el insumo en el sucesor (acotado al tamaño del buffer)
+                                size_t usado = strlen(suc->insumos);
+                                snprintf(suc->insumos + usado, sizeof suc->insumos - usado,
+                                         "%s%s", usado ? " | " : "", msj);
+
+                                suc->cont--;
+                                if (suc->cont == 0) suc->estado = LISTA;
                             }
-                        } else { 
-                           planificacion[i].estado = FALLIDA;
-                           printf("FIN %s FALLÓ\n", planificacion[i].id);
-                           tareas_finalizadas += abortar_rama(i);
+                        } else {
+                            planificacion[i].estado = FALLIDA;
+                            printf("FIN %s FALLÓ\n", planificacion[i].id);
+                            tareas_finalizadas += abortar_rama(i);
                         }
-                        break; 
+                        break;
                     }
                 }
             }
@@ -349,16 +350,4 @@ int main(int argc, char **argv) {
     return 0;
 }
 
-/**
-    // Prueba: mostrar lo que se cargó 
-    printf("Cargadas %d actividades (K = %d)\n", total_tareas, K);
-    for (int i = 0; i < total_tareas; i++) {
-        Proceso *t = &planificacion[i];
-        printf("%-4s %-16s %5d ms  deps pendientes: %d  sucesores: [",
-               t->id, t->nombre, t->tiempo, t->cont);
-        for (int s = 0; s < t->num_sucesores; s++)
-            printf("%s%s", s ? ", " : "", planificacion[t->sucesores[s]].id);
-        printf("]\n");
-    }
-    */
     
